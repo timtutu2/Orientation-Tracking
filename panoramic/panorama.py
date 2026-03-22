@@ -51,9 +51,16 @@ Usage
 import os
 import sys
 import pickle
-import argparse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from load_data import read_data
 
 import numpy as np
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_ROOT  = os.path.join(_SCRIPT_DIR, '..', '..', 'data')
+_TRAIN_DIR  = os.path.join(_DATA_ROOT, 'trainset')
+_TEST_DIR   = os.path.join(_DATA_ROOT, 'testset')
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -75,14 +82,6 @@ GYRO_SCALE  = VREF / 1023.0 / GYRO_SENSITIVITY * (np.pi / 180.0)  # rad/s / ADC 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data I/O helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def read_data(fname):
-    """Load a Python-2/3 compatible pickle file."""
-    with open(fname, 'rb') as f:
-        if sys.version_info[0] < 3:
-            return pickle.load(f)
-        return pickle.load(f, encoding='latin1')
-
 
 def parse_imu(imu_raw):
     """
@@ -531,127 +530,50 @@ def run_panorama(dataset_id, data_dir,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Hard-coded configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+OUTPUT_DIR   = os.path.join(_SCRIPT_DIR, 'results')
+OT_RESULTS   = os.path.join(_SCRIPT_DIR, '..', 'Orientation Tracking', 'results')
+
+DATASET      = 1          # dataset ID to run (train: 1,2,8,9 / test: 10,11)
+RUN_ALL      = True      # set True to run all datasets with camera data
+USE_VICON    = False      # set True to use Vicon ground-truth orientations
+
+PANO_H       = 960
+PANO_W       = 1920
+FOCAL_LENGTH = 280.0
+N_ITER       = 300
+LR           = 0.01
+N_STATIC     = 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _quats_for(ds):
+    """Return (quats_path, ts_path) from OT results if they exist, else (None, None)."""
+    q = os.path.join(OT_RESULTS, f'dataset{ds}_quats.npy')
+    t = os.path.join(OT_RESULTS, f'dataset{ds}_ts.npy')
+    return (q, t) if (os.path.exists(q) and os.path.exists(t)) else (None, None)
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='ECE 276A PR1 – Panoramic Image Construction',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-
-    # Dataset / data location
-    parser.add_argument('--dataset',    type=int,   default=1,
-                        help='Dataset ID  (default: 1)')
-    parser.add_argument('--data_dir',   type=str,   default='../../trainset',
-                        help='Root data folder containing imu/, cam/, vicon/ '
-                             '(default: ../../trainset)')
-    parser.add_argument('--all',        action='store_true',
-                        help='Run all datasets that have camera data '
-                             '(train 1,2,8,9 + test 10,11).  '
-                             'Use --data_dir_train and --data_dir_test.')
-    parser.add_argument('--data_dir_train', type=str, default='../../trainset',
-                        help='Training data root (used with --all)')
-    parser.add_argument('--data_dir_test',  type=str, default='../../testset',
-                        help='Test data root (used with --all)')
-
-    # Orientation source
-    orient = parser.add_mutually_exclusive_group()
-    orient.add_argument('--quats',      type=str,   default=None,
-                        help='Path to pre-saved quaternions .npy')
-    orient.add_argument('--use_vicon',  action='store_true',
-                        help='Use Vicon ground-truth orientations')
-    parser.add_argument('--ts',         type=str,   default=None,
-                        help='Path to pre-saved IMU timestamps .npy  '
-                             '(required with --quats)')
-
-    # Tracking hyper-parameters (ignored when --quats or --use_vicon)
-    parser.add_argument('--n_iter',     type=int,   default=300,
-                        help='PGD iterations  (default: 300)')
-    parser.add_argument('--lr',         type=float, default=0.01,
-                        help='PGD learning rate  (default: 0.01)')
-    parser.add_argument('--n_static',   type=int,   default=200,
-                        help='Static samples for bias estimation  (default: 200)')
-
-    # Panorama settings
-    parser.add_argument('--pano_H',       type=int,   default=360,
-                        help='Panorama height in pixels  (default: 360)')
-    parser.add_argument('--pano_W',       type=int,   default=720,
-                        help='Panorama width in pixels  (default: 720)')
-    parser.add_argument('--focal_length', type=float, default=280.0,
-                        help='Camera focal length in pixels  (default: 280)')
-
-    # Output
-    parser.add_argument('--output_dir',   type=str,   default='results',
-                        help='Output directory  (default: results/)')
-
-    args = parser.parse_args()
-
-    if args.all:
-        train_datasets = [1, 2, 8, 9]
-        test_datasets  = [10, 11]
-        print("Running all datasets with camera data…")
-        for ds in train_datasets:
-            # Auto-discover pre-saved quats in sibling results folder
-            sibling_results = os.path.join(
-                os.path.dirname(__file__),
-                '..', 'Orientation Tracking', 'results')
-            q_path = os.path.join(sibling_results, f'dataset{ds}_quats.npy')
-            t_path = os.path.join(sibling_results, f'dataset{ds}_ts.npy')
-            if not (os.path.exists(q_path) and os.path.exists(t_path)):
-                q_path = t_path = None
-            run_panorama(
-                dataset_id   = ds,
-                data_dir     = args.data_dir_train,
-                quats_path   = q_path,
-                ts_path      = t_path,
-                use_vicon    = args.use_vicon,
-                n_iter       = args.n_iter,
-                lr           = args.lr,
-                n_static     = args.n_static,
-                pano_H       = args.pano_H,
-                pano_W       = args.pano_W,
-                focal_length = args.focal_length,
-                output_dir   = args.output_dir,
-            )
-        for ds in test_datasets:
-            sibling_results = os.path.join(
-                os.path.dirname(__file__),
-                '..', 'Orientation Tracking', 'results')
-            q_path = os.path.join(sibling_results, f'dataset{ds}_quats.npy')
-            t_path = os.path.join(sibling_results, f'dataset{ds}_ts.npy')
-            if not (os.path.exists(q_path) and os.path.exists(t_path)):
-                q_path = t_path = None
-            run_panorama(
-                dataset_id   = ds,
-                data_dir     = args.data_dir_test,
-                quats_path   = q_path,
-                ts_path      = t_path,
-                use_vicon    = False,           # no Vicon in test set
-                n_iter       = args.n_iter,
-                lr           = args.lr,
-                n_static     = args.n_static,
-                pano_H       = args.pano_H,
-                pano_W       = args.pano_W,
-                focal_length = args.focal_length,
-                output_dir   = args.output_dir,
-            )
+    if RUN_ALL:
+        for ds in [1, 2, 8, 9]:
+            q_path, t_path = _quats_for(ds)
+            run_panorama(ds, _TRAIN_DIR, q_path, t_path, USE_VICON,
+                         N_ITER, LR, N_STATIC, PANO_H, PANO_W, FOCAL_LENGTH, OUTPUT_DIR)
+        for ds in [10, 11]:
+            q_path, t_path = _quats_for(ds)
+            run_panorama(ds, _TEST_DIR, q_path, t_path, False,
+                         N_ITER, LR, N_STATIC, PANO_H, PANO_W, FOCAL_LENGTH, OUTPUT_DIR)
     else:
-        run_panorama(
-            dataset_id   = args.dataset,
-            data_dir     = args.data_dir,
-            quats_path   = args.quats,
-            ts_path      = args.ts,
-            use_vicon    = args.use_vicon,
-            n_iter       = args.n_iter,
-            lr           = args.lr,
-            n_static     = args.n_static,
-            pano_H       = args.pano_H,
-            pano_W       = args.pano_W,
-            focal_length = args.focal_length,
-            output_dir   = args.output_dir,
-        )
+        data_dir = _TRAIN_DIR if DATASET <= 9 else _TEST_DIR
+        q_path, t_path = _quats_for(DATASET)
+        run_panorama(DATASET, data_dir, q_path, t_path, USE_VICON,
+                     N_ITER, LR, N_STATIC, PANO_H, PANO_W, FOCAL_LENGTH, OUTPUT_DIR)
 
 
 if __name__ == '__main__':

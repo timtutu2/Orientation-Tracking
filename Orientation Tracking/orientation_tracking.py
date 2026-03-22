@@ -12,15 +12,22 @@ Quaternion convention: (w, x, y, z) — scalar part first.
 Usage:
   python orientation_tracking.py --dataset 1 --data_dir ../../trainset
   python orientation_tracking.py --dataset 10 --data_dir ../../testset
-  python orientation_tracking.py --all --data_dir ../../trainset
+  python orientation_tracking.py --all --data_dir ../../trainset --data_dir_test ../../testset
 """
 
 import numpy as np
 import pickle
 import sys
 import os
-import argparse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from load_data import read_data
 import matplotlib
+
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_DATA_ROOT   = os.path.join(_SCRIPT_DIR, '..', '..', 'data')
+_TRAIN_DIR   = os.path.join(_DATA_ROOT, 'trainset')
+_TEST_DIR    = os.path.join(_DATA_ROOT, 'testset')
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
@@ -47,14 +54,6 @@ GYRO_SCALE  = VREF / 1023.0 / GYRO_SENSITIVITY * (np.pi / 180.0)  # rad/s per AD
 # ─────────────────────────────────────────────────────────────────────────────
 # Data I/O
 # ─────────────────────────────────────────────────────────────────────────────
-
-def read_data(fname):
-    """Load a pickle data file (Python-2/3 compatible)."""
-    with open(fname, 'rb') as f:
-        if sys.version_info[0] < 3:
-            return pickle.load(f)
-        return pickle.load(f, encoding='latin1')
-
 
 def load_dataset(dataset_id, data_dir):
     """Load IMU, Vicon (if available), and camera (if available) data."""
@@ -230,7 +229,7 @@ def qexp(v):
     v       : (..., 3)  vector part
     Returns : (..., 4)  unit quaternion
     """
-    theta      = torch.norm(v, dim=-1, keepdim=True)
+    theta      = torch.linalg.norm(v, dim=-1, keepdim=True)
     safe_theta = theta.clamp(min=1e-7)
     # sinc(theta) = sin(theta)/theta → 1 as theta→0; safe_theta avoids 0/0
     sinc = torch.sin(safe_theta) / safe_theta
@@ -251,7 +250,7 @@ def qlog(q):
     """
     w = q[..., :1]
     v = q[..., 1:]
-    v_norm     = torch.norm(v, dim=-1, keepdim=True)
+    v_norm     = torch.linalg.norm(v, dim=-1, keepdim=True)
     # Clamp v_norm so that theta/v_norm is finite and its gradient is finite
     # even when v ≈ 0.  When clamped, the coefficient ≈ atan2(eps, w)/eps ≈ 1/w ≈ 1.
     safe_v_norm = v_norm.clamp(min=1e-7)
@@ -326,7 +325,7 @@ def cost_function(q1T_flat, tau_omega, accel_meas, T):
     rel_rot = qmult(qinv(qt1), f_qt)              # q_{t+1}^{-1} ⊗ f(q_t,…)
     log_rel = qlog(rel_rot)                        # (T, 4)
     motion_cost = 0.5 * torch.sum(
-        torch.norm(2.0 * log_rel, dim=-1) ** 2
+        torch.linalg.norm(2.0 * log_rel, dim=-1) ** 2
     )
 
     # ── Observation model error ─────────────────────────────────────────────
@@ -334,7 +333,7 @@ def cost_function(q1T_flat, tau_omega, accel_meas, T):
     zeros = torch.zeros(T, 1, dtype=accel_meas.dtype, device=accel_meas.device)
     accel_quat = torch.cat([zeros, accel_meas], dim=-1)   # [0, a_t]
     obs_cost = 0.5 * torch.sum(
-        torch.norm(accel_quat - h_qt, dim=-1) ** 2
+        torch.linalg.norm(accel_quat - h_qt, dim=-1) ** 2
     )
 
     return motion_cost + obs_cost
@@ -367,7 +366,7 @@ def integrate_gyro(omega, ts, q0=None):
         qt        = torch.tensor(quats[t],            dtype=torch.float64).unsqueeze(0)
         tau_omega = torch.tensor(tau[t] * omega[:, t], dtype=torch.float64).unsqueeze(0)
         qt1       = motion_model(qt, tau_omega).squeeze(0)
-        qt1       = qt1 / torch.norm(qt1)
+        qt1       = qt1 / torch.linalg.norm(qt1)
         quats[t + 1] = qt1.detach().numpy()
 
     return quats   # (N, 4)
@@ -417,8 +416,7 @@ def pgd_orientation_tracking(omega, accel, ts, n_iter=300, lr=0.01, verbose=True
     if verbose:
         print(f"  PGD: T={T}, n_iter={n_iter}, lr={lr:.5f}")
 
-    current_lr = lr
-    prev_cost  = float('inf')
+    prev_cost = float('inf')
 
     for it in range(n_iter):
         # Fresh leaf tensor → ensures clean computation graph each iteration
@@ -430,20 +428,23 @@ def pgd_orientation_tracking(omega, accel, ts, n_iter=300, lr=0.01, verbose=True
         grad      = q_var.grad.detach().numpy()   # (T, 4)
         cost_val  = cost.item()
 
-        # Gradient step
-        q_opt = q_opt - current_lr * grad
+        # Gradient step (fixed learning rate — adaptive decay causes LR to
+        # collapse to ~0 on non-convex landscapes, freezing the optimiser)
+        q_opt = q_opt - lr * grad
 
         # Project: normalise each quaternion
         norms = np.linalg.norm(q_opt, axis=1, keepdims=True)
         q_opt = q_opt / np.maximum(norms, 1e-12)
 
-        # Adaptive learning rate: halve if cost increases
-        if cost_val > prev_cost * 1.01:
-            current_lr *= 0.5
+        # Convergence check
+        if abs(cost_val - prev_cost) < 1e-6:
+            if verbose:
+                print(f"    Converged at iter {it+1}: cost={cost_val:.6f}")
+            break
         prev_cost = cost_val
 
         if verbose and (it + 1) % 50 == 0:
-            print(f"    iter {it+1:4d}/{n_iter}: cost={cost_val:.4f}  lr={current_lr:.6f}")
+            print(f"    iter {it+1:4d}/{n_iter}: cost={cost_val:.4f}")
 
     # Prepend fixed q_0 = [1, 0, 0, 0]
     q0    = np.array([[1., 0., 0., 0.]])
@@ -611,36 +612,33 @@ def run_dataset(dataset_id, data_dir, n_iter=300, lr=0.01, n_static=200,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Hard-coded configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, 'results')
+
+DATASET    = 1      # dataset ID to run (train: 1–9 / test: 10–11)
+RUN_ALL    = True # set True to run all datasets (1–9 train + 10–11 test)
+
+N_ITER     = 300
+LR         = 0.01
+N_STATIC   = 500
+SHOW_PLOTS = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='ECE 276A PR1 – Orientation Tracking')
-    parser.add_argument('--dataset',    type=int,   default=1,
-                        help='Dataset ID (1–9 train, 10–11 test)')
-    parser.add_argument('--data_dir',   type=str,   default='../../trainset',
-                        help='Path to data directory')
-    parser.add_argument('--n_iter',     type=int,   default=300,
-                        help='PGD iterations')
-    parser.add_argument('--lr',         type=float, default=0.01,
-                        help='Initial PGD step size')
-    parser.add_argument('--n_static',   type=int,   default=200,
-                        help='Static samples for bias estimation')
-    parser.add_argument('--output_dir', type=str,   default='results',
-                        help='Output directory for plots / saved data')
-    parser.add_argument('--show',       action='store_true',
-                        help='Show interactive plots')
-    parser.add_argument('--all',        action='store_true',
-                        help='Run on all training datasets (1–9)')
-    args = parser.parse_args()
-
-    if args.all:
+    if RUN_ALL:
         for ds in range(1, 10):
-            run_dataset(ds, args.data_dir, args.n_iter, args.lr,
-                        args.n_static, args.output_dir, args.show)
+            run_dataset(ds, _TRAIN_DIR, N_ITER, LR, N_STATIC, OUTPUT_DIR, SHOW_PLOTS)
+        for ds in [10, 11]:
+            run_dataset(ds, _TEST_DIR, N_ITER, LR, N_STATIC, OUTPUT_DIR, SHOW_PLOTS)
     else:
-        run_dataset(args.dataset, args.data_dir, args.n_iter, args.lr,
-                    args.n_static, args.output_dir, args.show)
+        data_dir = _TRAIN_DIR if DATASET <= 9 else _TEST_DIR
+        run_dataset(DATASET, data_dir, N_ITER, LR, N_STATIC, OUTPUT_DIR, SHOW_PLOTS)
 
 
 if __name__ == '__main__':

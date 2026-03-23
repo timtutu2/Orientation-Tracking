@@ -1,53 +1,3 @@
-"""
-ECE 276A PR1 – Part 2: Panoramic Image Construction
-=====================================================
-
-Constructs an equirectangular panoramic image by stitching RGB camera
-images (320×240) over time, using the orientation estimates q_{1:T}
-from Part 1 (Orientation Tracking).
-
-Algorithm
----------
-For each camera frame k:
-  1. Find the closest-past orientation estimate (largest IMU timestamp ≤ cam timestamp).
-  2. Convert the quaternion to a rotation matrix R (body-to-world).
-  3. For each pixel (u, v) in the camera image:
-       - Build a unit direction ray in the body/camera frame using a pinhole model.
-       - Rotate the ray to world frame:  d_world = R @ d_body
-       - Convert (x, y, z) to spherical coordinates (azimuth φ, elevation θ).
-       - Map to equirectangular panorama pixel (px, py).
-  4. Write the pixel colour (simple overwrite, no blending).
-
-Camera model
-------------
-  • Optical axis aligned with the IMU / body x-axis.
-  • y-axis points right in the image; z-axis points up.
-  • Pinhole: focal length f ≈ 280 px (tunable), principal point (cx, cy).
-  • Ray direction in body frame: d = [f, u-cx, cy-v] (then normalised).
-
-Panorama layout
----------------
-  • Equirectangular projection
-  • Azimuth   φ ∈ [-π, π]      → horizontal axis (0 to pano_W)
-  • Elevation θ ∈ [-π/2, π/2] → vertical axis   (0 to pano_H, top = +π/2)
-
-Usage
------
-  # Use pre-saved orientations from Orientation Tracking results:
-  python panorama.py --dataset 1 \
-      --quats "../Orientation Tracking/results/dataset1_quats.npy" \
-      --ts    "../Orientation Tracking/results/dataset1_ts.npy"
-
-  # Re-run orientation tracking on-the-fly (requires PyTorch):
-  python panorama.py --dataset 1 --data_dir ../../trainset
-
-  # Run all datasets that have camera data (train: 1,2,8,9; test: 10,11):
-  python panorama.py --all --data_dir_train ../../trainset --data_dir_test ../../testset
-
-  # Use Vicon ground-truth orientations instead of estimates:
-  python panorama.py --dataset 1 --use_vicon
-"""
-
 import os
 import sys
 import pickle
@@ -84,15 +34,6 @@ GYRO_SCALE  = VREF / 1023.0 / GYRO_SENSITIVITY * (np.pi / 180.0)  # rad/s / ADC 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_imu(imu_raw):
-    """
-    Extract timestamps, raw accel, raw gyro from the 7×N IMU array.
-
-    Returns
-    -------
-    ts        : (N,)   unix timestamps in seconds
-    accel_raw : (3, N) raw ADC accelerometer values
-    gyro_raw  : (3, N) raw ADC gyroscope values
-    """
     data = np.array(imu_raw['vals'] if isinstance(imu_raw, dict) else imu_raw)
     ts        = data[0].flatten()
     accel_raw = data[1:4]
@@ -101,14 +42,6 @@ def parse_imu(imu_raw):
 
 
 def parse_vicon(vicon_raw):
-    """
-    Extract (N, 3, 3) body-to-world rotation matrices and timestamps from Vicon data.
-
-    Returns
-    -------
-    rots : (N, 3, 3)
-    ts   : (N,)
-    """
     if isinstance(vicon_raw, dict):
         rots = np.array(vicon_raw['rots'])
         ts   = np.array(vicon_raw['ts']).flatten()
@@ -126,16 +59,6 @@ def parse_vicon(vicon_raw):
 
 
 def parse_cam(cam_raw):
-    """
-    Extract images and timestamps from camera pickle data.
-
-    Raw shape: H × W × 3 × K  (240 × 320 × 3 × K)
-
-    Returns
-    -------
-    images : (K, H, W, 3) uint8 RGB images
-    ts     : (K,)         unix timestamps
-    """
     if isinstance(cam_raw, dict):
         images = np.array(cam_raw['cam'])
         ts     = np.array(cam_raw['ts']).flatten()
@@ -163,7 +86,6 @@ def parse_cam(cam_raw):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_bias(accel_raw, gyro_raw, vicon_rots, n_static=200):
-    """Estimate accel and gyro biases using the initial static period + Vicon R0."""
     n_static   = min(n_static, accel_raw.shape[1])
     bias_gyro  = np.mean(gyro_raw[:, :n_static], axis=1)
     R0         = vicon_rots[0]
@@ -174,7 +96,6 @@ def estimate_bias(accel_raw, gyro_raw, vicon_rots, n_static=200):
 
 
 def estimate_bias_no_vicon(accel_raw, gyro_raw, n_static=200):
-    """Bias estimation without Vicon: assumes device starts level, z-axis up."""
     n_static   = min(n_static, accel_raw.shape[1])
     bias_gyro  = np.mean(gyro_raw[:, :n_static], axis=1)
     mean_accel = np.mean(accel_raw[:, :n_static], axis=1)
@@ -183,7 +104,6 @@ def estimate_bias_no_vicon(accel_raw, gyro_raw, n_static=200):
 
 
 def calibrate_imu(accel_raw, gyro_raw, bias_accel, bias_gyro):
-    """Convert raw ADC to physical units: value = (raw - bias) × scale."""
     accel = (accel_raw - bias_accel[:, None]) * ACCEL_SCALE
     omega = (gyro_raw  - bias_gyro[:, None])  * GYRO_SCALE
     return accel, omega
@@ -194,19 +114,6 @@ def calibrate_imu(accel_raw, gyro_raw, bias_accel, bias_gyro):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_closest_past(query_ts, ref_ts):
-    """
-    For each query timestamp find the index of the closest-past reference
-    timestamp (largest ref_ts[i] ≤ query_ts).  Clamps to valid range.
-
-    Parameters
-    ----------
-    query_ts : scalar or array-like
-    ref_ts   : sorted 1-D array
-
-    Returns
-    -------
-    idx : int or (M,) int array
-    """
     idx = np.searchsorted(ref_ts, query_ts, side='right') - 1
     idx = np.clip(idx, 0, len(ref_ts) - 1)
     return idx
@@ -219,31 +126,6 @@ def find_closest_past(query_ts, ref_ts):
 def build_panorama(images, cam_ts, quats, orient_ts,
                    pano_H=360, pano_W=720,
                    focal_length=280.0):
-    """
-    Stitch camera frames into an equirectangular panoramic image.
-
-    For each camera frame the function:
-      1. Looks up the closest-past orientation quaternion.
-      2. Converts the quaternion to a body-to-world rotation matrix R.
-      3. Builds a direction ray for each pixel using the pinhole camera model
-         (optical axis = body x-axis, right = body y-axis, up = body z-axis).
-      4. Rotates rays to world frame and maps to equirectangular coordinates.
-      5. Writes pixel colours (overwrite; no blending needed per spec).
-
-    Parameters
-    ----------
-    images       : (K, H, W, 3) uint8  camera frames
-    cam_ts       : (K,)         float  camera timestamps (seconds)
-    quats        : (N, 4)       float  orientation quaternions (w, x, y, z)
-    orient_ts    : (N,)         float  timestamps matching quats
-    pano_H       : int                 output panorama height  (default 360)
-    pano_W       : int                 output panorama width   (default 720)
-    focal_length : float               pinhole focal length in pixels (default 280)
-
-    Returns
-    -------
-    panorama : (pano_H, pano_W, 3) uint8  equirectangular panorama
-    """
     K, H, W, _ = images.shape
     cx, cy = W / 2.0, H / 2.0
 
@@ -301,17 +183,6 @@ def build_panorama(images, cam_ts, quats, orient_ts,
 
 def build_panorama_from_vicon(images, cam_ts, vicon_rots, vicon_ts,
                                pano_H=360, pano_W=720, focal_length=280.0):
-    """
-    Same as build_panorama but accepts Vicon rotation matrices directly
-    (ground-truth orientations) rather than estimated quaternions.
-
-    Parameters
-    ----------
-    images      : (K, H, W, 3) uint8
-    cam_ts      : (K,) float
-    vicon_rots  : (N, 3, 3) float  body-to-world rotation matrices
-    vicon_ts    : (N,) float
-    """
     # Convert rotation matrices to quaternions so we can reuse build_panorama
     quats = np.array([mat2quat(R) for R in vicon_rots])  # (N, 4) w,x,y,z
     return build_panorama(images, cam_ts, quats, vicon_ts,
@@ -323,18 +194,6 @@ def build_panorama_from_vicon(images, cam_ts, vicon_rots, vicon_ts,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_orientation_tracking(dataset_id, data_dir, n_iter=300, lr=0.01, n_static=200):
-    """
-    Run PGD orientation tracking for one dataset.
-
-    Tries to import orientation_tracking.py from the sibling folder
-    '../Orientation Tracking/'.  Falls back to basic gyroscope integration
-    if that import fails (e.g. PyTorch not installed).
-
-    Returns
-    -------
-    quats    : (N, 4) float  quaternion trajectory (w,x,y,z)
-    imu_ts   : (N,)   float  IMU timestamps
-    """
     sibling = os.path.join(os.path.dirname(__file__), '..', 'Orientation Tracking')
     if os.path.isdir(sibling):
         sys.path.insert(0, os.path.abspath(sibling))
@@ -365,10 +224,6 @@ def run_orientation_tracking(dataset_id, data_dir, n_iter=300, lr=0.01, n_static
 
 
 def _gyro_only_tracking(dataset_id, data_dir, n_static=200):
-    """
-    Fallback: open-loop gyroscope integration (no PyTorch required).
-    Less accurate than PGD but still produces a usable panorama.
-    """
     imu_file  = os.path.join(data_dir, 'imu',   f'imuRaw{dataset_id}.p')
     vicon_file = os.path.join(data_dir, 'vicon', f'viconRot{dataset_id}.p')
 
@@ -425,32 +280,6 @@ def run_panorama(dataset_id, data_dir,
                  pano_H=360, pano_W=720,
                  focal_length=280.0,
                  output_dir='results'):
-    """
-    Build and save a panoramic image for one dataset.
-
-    Orientation source priority (highest to lowest):
-      1. Pre-saved .npy files  (--quats / --ts flags)
-      2. Vicon ground-truth    (--use_vicon flag)
-      3. On-the-fly PGD        (falls back to gyro integration if PyTorch absent)
-
-    Parameters
-    ----------
-    dataset_id   : int    dataset number (1–9 train, 10–11 test)
-    data_dir     : str    root folder containing imu/, cam/, vicon/ sub-folders
-    quats_path   : str    path to pre-saved quaternions .npy  (optional)
-    ts_path      : str    path to pre-saved IMU timestamps .npy  (optional)
-    use_vicon    : bool   use Vicon ground-truth orientations
-    n_iter       : int    PGD iterations (if running tracker)
-    lr           : float  PGD learning rate
-    n_static     : int    static samples for bias estimation
-    pano_H/W     : int    panorama dimensions in pixels
-    focal_length : float  camera focal length in pixels
-    output_dir   : str    directory to save the output PNG
-
-    Returns
-    -------
-    panorama : (pano_H, pano_W, 3) uint8  or None if no camera data
-    """
     print(f"\n{'='*62}")
     print(f"  Panorama  –  Dataset {dataset_id}")
     print(f"{'='*62}")
@@ -553,7 +382,6 @@ N_STATIC     = 500
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _quats_for(ds):
-    """Return (quats_path, ts_path) from OT results if they exist, else (None, None)."""
     q = os.path.join(OT_RESULTS, f'dataset{ds}_quats.npy')
     t = os.path.join(OT_RESULTS, f'dataset{ds}_ts.npy')
     return (q, t) if (os.path.exists(q) and os.path.exists(t)) else (None, None)

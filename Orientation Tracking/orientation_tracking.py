@@ -1,20 +1,3 @@
-"""
-ECE 276A PR1: Orientation Tracking via Projected Gradient Descent
-
-Implements:
-  1. IMU calibration (bias estimation using Vicon ground truth)
-  2. Gyroscope integration (open-loop, for verification)
-  3. Projected Gradient Descent over quaternion trajectory q_{1:T}
-     minimizing: c(q_{1:T}) = motion_error + observation_error
-
-Quaternion convention: (w, x, y, z) — scalar part first.
-
-Usage:
-  python orientation_tracking.py --dataset 1 --data_dir ../../trainset
-  python orientation_tracking.py --dataset 10 --data_dir ../../testset
-  python orientation_tracking.py --all --data_dir ../../trainset --data_dir_test ../../testset
-"""
-
 import numpy as np
 import pickle
 import sys
@@ -69,20 +52,6 @@ def load_dataset(dataset_id, data_dir):
 
 
 def parse_imu(imu_raw):
-    """
-    Extract timestamps, raw accelerometer, and raw gyroscope ADC values.
-
-    IMU data layout (7 × N array):
-        row 0 : unix timestamps (s)
-        rows 1-3 : Ax, Ay, Az  (raw ADC, 10-bit)
-        rows 4-6 : Wx, Wy, Wz  (raw ADC, 10-bit)
-
-    Returns
-    -------
-    ts        : (N,)   timestamps
-    accel_raw : (3, N) raw ADC accelerometer readings
-    gyro_raw  : (3, N) raw ADC gyroscope readings
-    """
     if isinstance(imu_raw, dict):
         key = 'vals' if 'vals' in imu_raw else list(imu_raw.keys())[0]
         data = np.array(imu_raw[key])
@@ -96,17 +65,6 @@ def parse_imu(imu_raw):
 
 
 def parse_vicon(vicon_raw):
-    """
-    Extract Vicon rotation matrices and timestamps.
-
-    Convention: R is a body-to-world rotation matrix, i.e.
-        v_world = R @ v_body
-
-    Returns
-    -------
-    rots : (N, 3, 3) rotation matrices
-    ts   : (N,)      timestamps
-    """
     if isinstance(vicon_raw, dict):
         rots = np.array(vicon_raw['rots'])
         ts   = np.array(vicon_raw['ts']).flatten()
@@ -129,25 +87,6 @@ def parse_vicon(vicon_raw):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_bias(accel_raw, gyro_raw, vicon_rots, n_static=200):
-    """
-    Estimate accelerometer and gyroscope biases from the initial static period.
-
-    Gyro bias  : mean raw gyro during static period (expected output = 0 rad/s).
-    Accel bias : raw accel mean minus the gravity vector in body frame
-                 (derived from the first Vicon rotation matrix).
-
-    Parameters
-    ----------
-    accel_raw   : (3, N) raw ADC accelerometer values
-    gyro_raw    : (3, N) raw ADC gyroscope values
-    vicon_rots  : (M, 3, 3) Vicon rotation matrices (body-to-world)
-    n_static    : number of initial samples assumed stationary
-
-    Returns
-    -------
-    bias_accel : (3,) accelerometer bias in ADC counts
-    bias_gyro  : (3,) gyroscope bias in ADC counts
-    """
     n_static = min(n_static, accel_raw.shape[1])
 
     # Gyro: mean during static period → offset to zero
@@ -165,7 +104,6 @@ def estimate_bias(accel_raw, gyro_raw, vicon_rots, n_static=200):
 
 
 def estimate_bias_no_vicon(accel_raw, gyro_raw, n_static=200):
-    """Bias estimation without Vicon: assumes device starts at rest, z-axis up."""
     n_static = min(n_static, accel_raw.shape[1])
     bias_gyro  = np.mean(gyro_raw[:, :n_static],  axis=1)
     mean_accel = np.mean(accel_raw[:, :n_static], axis=1)
@@ -176,15 +114,6 @@ def estimate_bias_no_vicon(accel_raw, gyro_raw, n_static=200):
 
 
 def calibrate_imu(accel_raw, gyro_raw, bias_accel, bias_gyro):
-    """
-    Convert raw ADC values to physical units using:
-        value = (raw - bias) × scale_factor
-
-    Returns
-    -------
-    accel : (3, N) acceleration in g
-    omega : (3, N) angular velocity in rad/s
-    """
     accel = (accel_raw - bias_accel[:, None]) * ACCEL_SCALE
     omega = (gyro_raw  - bias_gyro[:, None])  * GYRO_SCALE
     return accel, omega
@@ -195,12 +124,6 @@ def calibrate_imu(accel_raw, gyro_raw, bias_accel, bias_gyro):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def qmult(q1, q2):
-    """
-    Hamilton product of two quaternions.
-
-    q1, q2 : (..., 4)  [w, x, y, z]
-    Returns : (..., 4)
-    """
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
     w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
     return torch.stack([
@@ -212,23 +135,11 @@ def qmult(q1, q2):
 
 
 def qinv(q):
-    """Quaternion conjugate (= inverse for unit quaternions). q: (..., 4)."""
     s = torch.tensor([1., -1., -1., -1.], dtype=q.dtype, device=q.device)
     return q * s
 
 
 def qexp(v):
-    """
-    Quaternion exponential of a pure quaternion [0, v].
-
-    exp([0, v]) = [cos(||v||), sinc(||v||) * v]
-
-    Uses safe sinc = sin(theta)/theta (avoids torch.where to prevent NaN
-    in backward when theta → 0).
-
-    v       : (..., 3)  vector part
-    Returns : (..., 4)  unit quaternion
-    """
     theta      = torch.linalg.norm(v, dim=-1, keepdim=True)
     safe_theta = theta.clamp(min=1e-7)
     # sinc(theta) = sin(theta)/theta → 1 as theta→0; safe_theta avoids 0/0
@@ -237,17 +148,6 @@ def qexp(v):
 
 
 def qlog(q):
-    """
-    Quaternion logarithm for a unit quaternion q = [w, x, y, z].
-
-    log(q) = [0,  (theta / v_norm) * v]   where  theta = atan2(v_norm, w)
-
-    Uses atan2 (rather than acos) and clamps v_norm to avoid NaN in the
-    backward pass when v_norm → 0 (near-identity rotation).
-
-    q       : (..., 4)
-    Returns : (..., 4)  pure quaternion
-    """
     w = q[..., :1]
     v = q[..., 1:]
     v_norm     = torch.linalg.norm(v, dim=-1, keepdim=True)
@@ -264,29 +164,10 @@ def qlog(q):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def motion_model(qt, tau_omega):
-    """
-    Quaternion kinematics one-step prediction (Eq. 1):
-
-        f(qt, τω) = qt ⊗ exp([0, τω / 2])
-
-    qt        : (T, 4)  current quaternion
-    tau_omega : (T, 3)  τ_t · ω_t  (time-step × angular velocity)
-    Returns   : (T, 4)  predicted next quaternion
-    """
     return qmult(qt, qexp(tau_omega / 2.0))
 
 
 def observation_model(qt):
-    """
-    Expected accelerometer reading in body frame (Eq. 2):
-
-        h(qt) = qt^{-1} ⊗ [0, 0, 0, 1] ⊗ qt
-
-    Rotates world-frame gravity [0, 0, 1] into body frame.
-
-    qt      : (T, 4)
-    Returns : (T, 4)  pure quaternion  [0, a_body]
-    """
     T = qt.shape[0]
     g = torch.tensor([0., 0., 0., 1.], dtype=qt.dtype, device=qt.device)
     g = g.unsqueeze(0).expand(T, -1)
@@ -298,19 +179,6 @@ def observation_model(qt):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cost_function(q1T_flat, tau_omega, accel_meas, T):
-    """
-    c(q_{1:T}) = ½ Σ_{t=0}^{T-1} ‖2 log(q_{t+1}^{-1} ⊗ f(q_t, τ_t ω_t))‖²
-               + ½ Σ_{t=1}^{T}   ‖[0, a_t] − h(q_t)‖²
-
-    Parameters
-    ----------
-    q1T_flat  : (T*4,)  flattened q_{1:T}, requires_grad=True
-    tau_omega : (T, 3)  τ_t · ω_t  for t = 0, …, T-1  (constant)
-    accel_meas: (T, 3)  a_t          for t = 1, …, T    (constant)
-    T         : int     number of optimised quaternion states
-
-    Returns scalar cost tensor.
-    """
     q1T = q1T_flat.reshape(T, 4)
 
     # Build full trajectory  q_0 (fixed) | q_{1:T}
@@ -344,16 +212,6 @@ def cost_function(q1T_flat, tau_omega, accel_meas, T):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def integrate_gyro(omega, ts, q0=None):
-    """
-    Open-loop integration of angular velocity:
-        q_{t+1} = q_t ⊗ exp([0, τ_t ω_t / 2])   (normalised each step)
-
-    omega : (3, N) angular velocity in rad/s
-    ts    : (N,)   timestamps in seconds
-    q0    : (4,)   initial quaternion  [1, 0, 0, 0]  (default)
-
-    Returns : (N, 4) quaternion trajectory
-    """
     N = omega.shape[1]
     if q0 is None:
         q0 = np.array([1., 0., 0., 0.])
@@ -377,26 +235,6 @@ def integrate_gyro(omega, ts, q0=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pgd_orientation_tracking(omega, accel, ts, n_iter=300, lr=0.01, verbose=True):
-    """
-    Minimise c(q_{1:T}) using projected gradient descent (Eq. 4).
-
-    After each gradient step the quaternions are normalised (projected onto H*):
-        Π_{H*}(q) = q / ‖q‖
-
-    Initialised with the open-loop gyro integration.
-
-    Parameters
-    ----------
-    omega  : (3, N)  calibrated angular velocity in rad/s
-    accel  : (3, N)  calibrated acceleration in g
-    ts     : (N,)    IMU timestamps in seconds
-    n_iter : int     number of gradient-descent iterations
-    lr     : float   initial step size
-
-    Returns
-    -------
-    quats : (N, 4) optimised quaternion trajectory  (q_0 … q_{T})
-    """
     N   = omega.shape[1]
     T   = N - 1                             # states to optimise: q_1 … q_T
     tau = np.diff(ts)                       # (T,) time steps
@@ -457,7 +295,6 @@ def pgd_orientation_tracking(omega, accel, ts, n_iter=300, lr=0.01, verbose=True
 # ─────────────────────────────────────────────────────────────────────────────
 
 def quats_to_euler(quats):
-    """Convert (N, 4) quaternions (w,x,y,z) to (N, 3) Euler angles [rad]."""
     angles = np.zeros((len(quats), 3))
     for i, q in enumerate(quats):
         n = np.linalg.norm(q)
@@ -467,7 +304,6 @@ def quats_to_euler(quats):
 
 
 def rotmats_to_euler(rots):
-    """Convert (N, 3, 3) rotation matrices to (N, 3) Euler angles [rad]."""
     angles = np.zeros((len(rots), 3))
     for i, R in enumerate(rots):
         angles[i] = mat2euler(R, axes='sxyz')
@@ -480,16 +316,6 @@ def rotmats_to_euler(rots):
 
 def plot_euler_comparison(est_ts, euler_est, vicon_ts, euler_vicon,
                           title, save_path=None):
-    """
-    Plot estimated vs. ground-truth roll, pitch, and yaw.
-
-    est_ts      : (N,)   IMU timestamps
-    euler_est   : (N, 3) estimated Euler angles in radians
-    vicon_ts    : (M,)   Vicon timestamps  (or None)
-    euler_vicon : (M, 3) ground-truth Euler angles in radians  (or None)
-    title       : str    figure title
-    save_path   : str    if set, saves the figure to this path
-    """
     labels = ['Roll', 'Pitch', 'Yaw']
     fig, axes = plt.subplots(3, 1, figsize=(14, 9))
     fig.suptitle(title, fontsize=14)
@@ -521,21 +347,6 @@ def plot_euler_comparison(est_ts, euler_est, vicon_ts, euler_vicon,
 
 def run_dataset(dataset_id, data_dir, n_iter=300, lr=0.01, n_static=200,
                 output_dir='results', show_plots=False):
-    """
-    End-to-end orientation tracking for one dataset.
-
-    Steps
-    -----
-    1. Load IMU / Vicon data
-    2. Calibrate IMU (estimate biases)
-    3. Open-loop gyroscope integration  → roll/pitch/yaw plot
-    4. Projected Gradient Descent       → optimised roll/pitch/yaw plot
-
-    Returns
-    -------
-    q_pgd   : (N, 4) optimised quaternion trajectory
-    imu_ts  : (N,)   IMU timestamps
-    """
     print(f"\n{'='*60}")
     print(f"  Dataset {dataset_id}")
     print(f"{'='*60}")
